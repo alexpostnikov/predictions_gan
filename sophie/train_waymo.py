@@ -276,6 +276,12 @@ def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
         g_l2_loss_rel.append(dist)
 
     npeds = obs_traj.size(1)  # bs
+    pr = torch.stack(predictions, dim=0)
+    ll = 0.01 * -log_likelihood(pred_traj_gt_rel[torch.arange(80)[4::5]].permute(1, 0, 2).unsqueeze(2),
+                                pr.permute(2, 1, 0, 3),
+                                weights=torch.ones(npeds, BEST_K).cuda() / BEST_K)
+    losses['G_diversity_loss'] = ll.mean()
+    loss += ll.mean()
     g_l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
     g_l2_loss_rel = torch.stack(g_l2_loss_rel, dim=1)  # times, modes, bs
     diver_loss = 0.1 * 1 / (g_l2_loss_rel.std(1) / 100 + 0.1)
