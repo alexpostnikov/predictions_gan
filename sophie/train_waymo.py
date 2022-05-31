@@ -12,11 +12,47 @@ import tqdm
 from data import data_loader
 from utils import get_dset_path
 from utils import relative_to_abs
-from utils import gan_g_loss, gan_d_loss, l2_loss, displacement_error, final_displacement_error
+from utils import gan_g_loss, gan_d_loss, l2_loss, displacement_error, final_displacement_error, displacement_error_by_time
 from models_waymo import TrajectoryGenerator, TrajectoryDiscriminator
 import wandb
 from visualization import vis_cur_and_fut
 from constants import *
+from torch.utils.data import Subset
+
+
+def log_likelihood(ground_truth, predicted, weights, sigma=1.0, vels=None) -> torch.Tensor:
+    """Calculates log-likelihood of the ground_truth trajectory
+    under the factorized gaussian mixture parametrized by predicted trajectories, weights and sigma.
+    Please follow the link below for the metric formulation:
+    https://github.com/yandex-research/shifts/blob/195b3214ff41e5b6c197ea7ef3e38552361f29fb/sdc/ysdc_dataset_api/evaluation/log_likelihood_based_metrics.pdf
+
+    Args:
+        ground_truth (np.ndarray): ground truth trajectory, (n_timestamps, 2)
+        predicted (np.ndarray): predicted trajectories, (n_modes, n_timestamps, 2)
+        weights (np.ndarray): confidence weights associated with trajectories, (n_modes,)
+        sigma (float, optional): distribution standart deviation. Defaults to 1.0.
+
+    Returns:
+        float: calculated log-likelihood
+    """
+    #     assert_weights_near_one(weights)
+    #     assert_weights_non_negative(weights)
+    #     print(ground_truth.shape,  predicted.shape)
+
+    displacement_norms_squared = torch.sum((ground_truth - predicted) ** 2, dim=-1)
+
+    displacement_norms_squared = torch.clamp(displacement_norms_squared, max=1e6)
+    normalizing_const = torch.log(2 * np.pi * torch.tensor(sigma) ** 2).to(displacement_norms_squared.device)
+
+    lse_args = torch.log(weights + 1e-6) - torch.sum(
+        normalizing_const + 0.5 * displacement_norms_squared.permute(0, 2, 1) / sigma ** 2, dim=-1)
+    if ground_truth.ndim == 4:
+        max_arg = lse_args.max(1).values.reshape(-1, 1)
+    else:
+        max_arg = lse_args.max()
+
+    ll = torch.log(torch.sum(torch.exp(lse_args - max_arg), -1) + 1e-6) + max_arg.reshape(-1)
+    return ll
 
 
 def init_weights(m):
@@ -29,26 +65,21 @@ def get_dtypes():
     return torch.cuda.LongTensor, torch.cuda.FloatTensor
 
 
-
-
 def main():
     from waymoDs import WaymoSophieDS, d_collate_fn
     from torch.utils.data import DataLoader
 
-    wandb.init(project="waymo-sophie", entity="aleksey-postnikov", name="waymo_sophie_train_base_angle")
+    wandb.init(project="waymo-sophie", entity="aleksey-postnikov", name="nll_gan")
 
     print("Initializing train dataset")
     ds_path = "/media/robot/hdd1/waymo_ds/"
     in_path = "/media/robot/hdd1/waymo_ds/training_mapstyle/index_file.txt"
 
     train_dset = WaymoSophieDS(data_path=ds_path, index_file=in_path,
-                                  rgb_index_path="/media/robot/hdd1/waymo_ds/rendered/train/index.pkl",
-                                  rgb_prefix="/media/robot/hdd1/waymo_ds/")
-    train_loader = DataLoader(train_dset, batch_size=2, shuffle=False, num_workers=0, collate_fn=d_collate_fn)
-
+                               rgb_index_path="/media/robot/hdd1/waymo_ds/rendered/train/index.pkl",
+                               rgb_prefix="/media/robot/hdd1/waymo_ds/")
+    train_loader = DataLoader(train_dset, batch_size=2, shuffle=False, num_workers=8, collate_fn=d_collate_fn)
     long_dtype, float_dtype = get_dtypes()
-
-
 
     print("Initializing val dataset")
     val_ds_path = "/media/robot/hdd1/waymo_ds/"
@@ -91,8 +122,8 @@ def main():
         pbar = tqdm.tqdm(train_loader, total=iterations_per_epoch)
         for data in pbar:
             out = preprocess_batch_to_predict_with_img(data)
-            past_current_local, future_to_predict_local, state_to_predict, future_to_predict, rot,\
-             trans, imgs, state_to_predict_with_neighbours_local, state_to_predict_with_neighbours, future_valid = out
+            past_current_local, future_to_predict_local, state_to_predict, future_to_predict, rot, \
+            trans, imgs, state_to_predict_with_neighbours_local, state_to_predict_with_neighbours, future_valid = out
             inv_rot = torch.inverse(rot)
             batch = (state_to_predict_with_neighbours, future_to_predict, state_to_predict_with_neighbours_local,
                      future_to_predict_local, imgs, inv_rot, future_valid)
@@ -105,48 +136,39 @@ def main():
                 d_steps_left -= 1
             if g_steps_left > 0:
                 losses_g, predictions = generator_step(batch, generator,
-                                          discriminator, gan_g_loss,
-                                          optimizer_g)
+                                                       discriminator, gan_g_loss,
+                                                       optimizer_g)
                 g_steps_left -= 1
                 str_to_log += ' G_loss: {}'.format(losses_g)
                 pbar.set_description(str_to_log)
+
                 if (t + 1) % 100 == 0:
-                    predictions = torch.stack(predictions).detach().cpu()
+                    predictions = torch.stack(predictions).detach().cpu()  # K_samples, 16, bs, 2
+                    # [plt.plot(torch.stack(predictions).detach().cpu()[i, :, 0, 0].reshape(-1),
+                    #           torch.stack(predictions).detach().cpu()[i, :, 0, 1].reshape(-1), linewidth=0.9) for i in
+                    #  range(20)]
                     state_to_predict_p = state_to_predict_with_neighbours.permute(2, 0, 1, 3)
-                    predictions_abs, predictions_rel = rotate_predictions_to_abs_cs(predictions, state_to_predict_p, inv_rot)
-                    predictions_abs = predictions_abs.permute(0, 2, 1).reshape(-1, 20, PRED_LEN, 2).permute(0,2,1,3)
+
+                    predictions_abs, predictions_rel = rotate_predictions_to_abs_cs(predictions, state_to_predict_p,
+                                                                                    inv_rot)
+                    predictions_abs = predictions_abs.permute(0, 2, 1).reshape(-1, 20, PRED_LEN, 2).permute(0, 2, 1, 3)
                     imgs = vis_cur_and_fut(data, predictions_abs)
-                    wandb.log({'train/G_loss': losses_g, "examples": [wandb.Image(imgs)]})
-                    # wandb.log({'train/G_loss': losses_g, 'train/D_loss': losses_d, "examples": [wandb.Image(imgs)]})
+                    # wandb.log({'train/G_loss': losses_g, "examples": [wandb.Image(imgs)]})
+                    wandb.log({'train/G_loss': losses_g, 'train/D_loss': losses_d, "examples": [wandb.Image(imgs)]})
                 else:
                     # wandb.log({'train/G_loss': losses_g, 'train/D_loss': losses_d})
                     wandb.log({'train/G_loss': losses_g})
             # if d_steps_left > 0 or g_steps_left > 0:
-            if  g_steps_left > 0:
+            if g_steps_left > 0:
                 continue
 
-
-
-            if (t+1) % PRINT_EVERY == 0:
-                print('t = {} / {}'.format(t + 1, NUM_ITERATIONS))
-                for k, v in sorted(losses_d.items()):
-                    print('  [D] {}: {:.3f}'.format(k, v))
-                for k, v in sorted(losses_g.items()):
-                    print('  [G] {}: {:.3f}'.format(k, v))
+            if (t + 1) % PRINT_EVERY == 0:
 
                 print('Checking stats on val ...')
-                metrics_val = check_accuracy(val_loader, generator, discriminator, gan_d_loss)
+                metrics_val = check_accuracy(val_loader, generator, discriminator, gan_d_loss, limit=True)
 
-                print('Checking stats on train ...')
-                metrics_train = check_accuracy(train_loader, generator, discriminator, gan_d_loss, limit=True)
-
-                for k, v in sorted(metrics_val.items()):
-                    print('  [val] {}: {:.3f}'.format(k, v))
-                for k, v in sorted(metrics_train.items()):
-                    print('  [train] {}: {:.3f}'.format(k, v))
-
-                if min_ade is None or metrics_val['ade'] < min_ade:
-                    min_ade = metrics_val['ade']
+                if min_ade is None or metrics_val['val/ade'] < min_ade:
+                    min_ade = metrics_val['val/ade']
                     checkpoint = {'t': t, 'g': generator.state_dict(), 'd': discriminator.state_dict(),
                                   'g_optim': optimizer_g.state_dict(), 'd_optim': optimizer_d.state_dict()}
                     print("Saving checkpoint to model.pt")
@@ -174,11 +196,15 @@ def discriminator_step(batch, generator, discriminator, d_loss_fn, optimizer_d):
     generator_out = generator(obs_traj, obs_traj_rel, vgg_list)
 
     pred_traj_fake_abs, pred_traj_fake_rel = rotate_predictions_to_abs_cs(generator_out, obs_traj, rot_mat_inv)
-    pred_traj_fake_abs[future_valid.permute(1, 0) == 0] *= 0
-    pred_traj_fake_rel[future_valid.permute(1, 0) == 0] *= 0
-    pred_traj_gt_rel[future_valid.permute(1, 0) == 0] *= 0
-    pred_traj_gt[future_valid.permute(1, 0) == 0] *= 0
-    #pred_traj_fake_abs = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
+
+    future_valid = future_valid.permute(1, 0)[[torch.arange(80)[4::5]]]
+    pred_traj_gt_rel = pred_traj_gt_rel[[torch.arange(80)[4::5]]]
+    pred_traj_gt = pred_traj_gt[[torch.arange(80)[4::5]]]
+    pred_traj_fake_abs[future_valid == 0] *= 0
+    pred_traj_fake_rel[future_valid == 0] *= 0
+    pred_traj_gt_rel[future_valid == 0] *= 0
+    pred_traj_gt[future_valid == 0] *= 0
+    # pred_traj_fake_abs = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
 
     traj_real = torch.cat([obs_traj[:, :, 0, :], pred_traj_gt], dim=0)
     traj_real_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_gt_rel], dim=0)
@@ -216,7 +242,7 @@ def rotate_predictions_to_abs_cs(generator_out, obs_traj, rot_mat_inv):
         assert generator_out.shape == (20, PRED_LEN, BATCH_SIZE, 2)
         assert rot_mat_inv.shape == (BATCH_SIZE, 2, 2)
         assert obs_traj.shape == (OBS_LEN, BATCH_SIZE, MAX_PEDS, 2)
-        pred_traj_fake_rel = generator_out.permute(2, 3, 0,  1, ).reshape(-1, 2, PRED_LEN * 20)
+        pred_traj_fake_rel = generator_out.permute(2, 3, 0, 1, ).reshape(-1, 2, 20 * PRED_LEN)
         # rotate back
         pred_traj_fake_rel_rot = torch.bmm(rot_mat_inv.float(), pred_traj_fake_rel)
         # translate back
@@ -248,10 +274,6 @@ def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
 
         dist = torch.norm(pred_traj_fake_rel - pred_traj_gt_rel[torch.arange(80)[4::5]], dim=2)
         g_l2_loss_rel.append(dist)
-        # g_l2_loss_rel.append(l2_loss(
-        #     pred_traj_fake_abs,
-        #     pred_traj_gt,
-        #     mode='raw'))
 
     npeds = obs_traj.size(1)  # bs
     g_l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
@@ -261,7 +283,7 @@ def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
 
     losses['G_diversity_loss'] = diver_loss.mean().item()
     loss += diver_loss.mean()
-    _g_l2_loss_rel = torch.min(_g_l2_loss_rel, 0).values.mean() / (PRED_LEN)
+    _g_l2_loss_rel = torch.min(_g_l2_loss_rel, 0).values.mean() / PRED_LEN
     g_l2_loss_sum_rel += _g_l2_loss_rel
     losses['G_l2_loss_rel'] = g_l2_loss_sum_rel.item()
 
@@ -289,6 +311,10 @@ def check_accuracy(loader, generator, discriminator, d_loss_fn, limit=False):
     metrics = {}
     g_l2_losses_abs, g_l2_losses_rel = ([],) * 2
     disp_error = []
+    ades_8 = []
+    ades_5 = []
+    ades_3 = []
+    ades_1 = []
     f_disp_error = []
     total_traj = 0
 
@@ -297,27 +323,44 @@ def check_accuracy(loader, generator, discriminator, d_loss_fn, limit=False):
     with torch.no_grad():
         for data in loader:
             out = preprocess_batch_to_predict_with_img(data)
-            past_current_local, future_to_predict_local, state_to_predict, future_to_predict, rot_mat,\
+            past_current_local, future_to_predict_local, state_to_predict, future_to_predict, rot, \
             trans, imgs, state_to_predict_with_neighbours_local, state_to_predict_with_neighbours, future_valid = out
-
-            state_to_predict_with_neighbours = state_to_predict_with_neighbours.permute(2, 0, 1, 3)
-            state_to_predict_with_neighbours_local = state_to_predict_with_neighbours_local.permute(2, 0, 1, 3)
-            future_to_predict_local = future_to_predict_local.permute(1, 0, 2)
-            future_to_predict = future_to_predict.permute(1, 0, 2)
-
+            inv_rot = torch.inverse(rot)
             batch = (state_to_predict_with_neighbours, future_to_predict, state_to_predict_with_neighbours_local,
-                     future_to_predict_local, imgs, torch.inverse(rot_mat), future_valid)
+                     future_to_predict_local, imgs, inv_rot, future_valid)
             batch = [tensor.cuda() for tensor in batch]
-            (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, vgg_list, rot_mat_inv, future_valid) = batch
 
+            (obs_traj_, pred_traj_gt_, obs_traj_rel_, pred_traj_gt_rel_, vgg_list, rot_mat_inv, future_valid) = batch
+            obs_traj = obs_traj_.permute(2, 0, 1, 3)
+            obs_traj_rel = obs_traj_rel_.permute(2, 0, 1, 3)
+            pred_traj_gt_rel = pred_traj_gt_rel_.permute(1, 0, 2)[[torch.arange(80)[4::5]]]
+            pred_traj_gt = pred_traj_gt_.permute(1, 0, 2)[[torch.arange(80)[4::5]]]
+            future_valid = future_valid[:, torch.arange(80)[4::5]]
             pred_traj_fake_rel = generator(obs_traj, obs_traj_rel, vgg_list)
-            pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
+            state_to_predict_p = state_to_predict_with_neighbours.to(pred_traj_fake_rel.device).permute(2, 0, 1, 3)
+            pred_traj_fake, _ = rotate_predictions_to_abs_cs(pred_traj_fake_rel, state_to_predict_p,
+                                                             inv_rot.cuda())
+            # pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
 
             g_l2_loss_abs = l2_loss(pred_traj_fake, pred_traj_gt, mode='sum')
             g_l2_loss_rel = l2_loss(pred_traj_fake_rel, pred_traj_gt_rel, mode='sum')
 
-            ade = displacement_error(pred_traj_fake, pred_traj_gt)
-            fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1])
+            ade = displacement_error(pred_traj_fake, pred_traj_gt, future_valid)
+            ade_8 = displacement_error_by_time(pred_traj_fake, pred_traj_gt, future_valid, 8)
+            # if is not None:
+            if not np.isnan(ade_8.cpu()).item():
+                ades_8.append(ade_8.item())
+            ade_5 = displacement_error_by_time(pred_traj_fake, pred_traj_gt, future_valid, 5)
+            if not np.isnan(ade_5.cpu()).item():
+                ades_5.append(ade_5.item())
+            ade_3 = displacement_error_by_time(pred_traj_fake, pred_traj_gt, future_valid, 3)
+            if not np.isnan(ade_3.cpu()).item():
+                ades_3.append(ade_3.item())
+
+            ade_1 = displacement_error_by_time(pred_traj_fake, pred_traj_gt, future_valid, 1)
+            if not np.isnan(ade_1.cpu()).item():
+                ades_1.append(ade_1.item())
+            fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1], future_valid)
 
             traj_real = torch.cat([obs_traj[:, :, 0, :], pred_traj_gt], dim=0)
             traj_real_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_gt_rel], dim=0)
@@ -333,23 +376,28 @@ def check_accuracy(loader, generator, discriminator, d_loss_fn, limit=False):
             g_l2_losses_abs.append(g_l2_loss_abs.item())
             g_l2_losses_rel.append(g_l2_loss_rel.item())
             disp_error.append(ade.item())
-            f_disp_error.append(fde.item())
+            if not np.isnan(fde.cpu()).item():
+                f_disp_error.append(fde.item())
 
             mask_sum += (pred_traj_gt.size(1) * PRED_LEN)
             total_traj += pred_traj_gt.size(1)
             if limit and total_traj >= NUM_SAMPLES_CHECK:
                 break
 
-    metrics['d_loss'] = sum(d_losses) / len(d_losses)
-    metrics['g_l2_loss_abs'] = sum(g_l2_losses_abs) / mask_sum
-    metrics['g_l2_loss_rel'] = sum(g_l2_losses_rel) / mask_sum
+    metrics['val/d_loss'] = sum(d_losses) / len(d_losses)
+    metrics['val/g_l2_loss_abs'] = sum(g_l2_losses_abs) / mask_sum
+    metrics['val/g_l2_loss_rel'] = sum(g_l2_losses_rel) / mask_sum
 
-    metrics['ade'] = sum(disp_error) / (total_traj * PRED_LEN)
-    metrics['fde'] = sum(f_disp_error) / total_traj
+    metrics['val/ade'] = sum(disp_error) / len(disp_error)
+    metrics['val/ade_8'] = sum(ades_8) / len(ades_8)
+    metrics['val/ade_5'] = sum(ades_5) / len(ades_5)
+    metrics['val/ade_3'] = sum(ades_3) / len(ades_3)
+    metrics['val/ade_1'] = sum(ades_1) / len(ades_1)
+    metrics['val/fde'] = sum(f_disp_error) / len(f_disp_error)
+    wandb.log(metrics)
     generator.train()
     return metrics
 
 
 if __name__ == '__main__':
     main()
-
