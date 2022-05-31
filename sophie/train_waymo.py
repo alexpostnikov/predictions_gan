@@ -12,7 +12,8 @@ import tqdm
 from data import data_loader
 from utils import get_dset_path
 from utils import relative_to_abs
-from utils import gan_g_loss, gan_d_loss, l2_loss, displacement_error, final_displacement_error, displacement_error_by_time
+from utils import gan_g_loss, gan_d_loss, l2_loss, displacement_error, final_displacement_error, \
+    displacement_error_by_time
 from models_waymo import TrajectoryGenerator, TrajectoryDiscriminator
 import wandb
 from visualization import vis_cur_and_fut
@@ -277,23 +278,23 @@ def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
 
     npeds = obs_traj.size(1)  # bs
     pr = torch.stack(predictions, dim=0)
-    ll = 0.01 * -log_likelihood(pred_traj_gt_rel[torch.arange(80)[4::5]].permute(1, 0, 2).unsqueeze(2),
-                                pr.permute(2, 1, 0, 3),
-                                weights=torch.ones(npeds, BEST_K).cuda() / BEST_K)
+    ll = 0.1 * -log_likelihood(pred_traj_gt_rel[torch.arange(80)[4::5]].permute(1, 0, 2).unsqueeze(2),
+                               pr.permute(2, 1, 0, 3),
+                               weights=torch.ones(npeds, BEST_K).cuda() / BEST_K)
     losses['G_diversity_loss'] = ll.mean()
-    loss += ll.mean()
+    loss += NLL_LOSS_COEF * ll.mean()
+
     g_l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
     g_l2_loss_rel = torch.stack(g_l2_loss_rel, dim=1)  # times, modes, bs
-    diver_loss = 0.1 * 1 / (g_l2_loss_rel.std(1) / 100 + 0.1)
     _g_l2_loss_rel = torch.sum(g_l2_loss_rel, dim=0)  # modes, bs
-
-    losses['G_diversity_loss'] = diver_loss.mean().item()
-    loss += diver_loss.mean()
     _g_l2_loss_rel = torch.min(_g_l2_loss_rel, 0).values.mean() / PRED_LEN
     g_l2_loss_sum_rel += _g_l2_loss_rel
     losses['G_l2_loss_rel'] = g_l2_loss_sum_rel.item()
-
     loss += g_l2_loss_sum_rel
+
+    diver_loss = 0.1 * 1 / (g_l2_loss_rel.std(1) / 100 + 0.1)
+    losses['G_diversity_loss'] = diver_loss.mean().item()
+    loss += DIVERSITY_LOSS_COEF * diver_loss.mean()
 
     traj_fake = torch.cat([obs_traj[:, :, 0, :], pred_traj_fake_abs], dim=0)
     traj_fake_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_fake_rel], dim=0)
@@ -348,8 +349,12 @@ def check_accuracy(loader, generator, discriminator, d_loss_fn, limit=False):
                                                              inv_rot.cuda())
             # pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
 
-            g_l2_loss_abs = l2_loss(pred_traj_fake, pred_traj_gt, mode='sum')
-            g_l2_loss_rel = l2_loss(pred_traj_fake_rel, pred_traj_gt_rel, mode='sum')
+            pred_traj_fake_rel_masked = pred_traj_fake_rel * future_valid.permute(1, 0).unsqueeze(-1)
+            pred_traj_gt_rel_masked = pred_traj_gt_rel * future_valid.permute(1, 0).unsqueeze(-1)
+            pred_traj_fake_masked = pred_traj_fake * future_valid.permute(1, 0).unsqueeze(-1)
+            pred_traj_gt_masked = pred_traj_gt * future_valid.permute(1, 0).unsqueeze(-1)
+            g_l2_loss_abs = l2_loss(pred_traj_fake_masked, pred_traj_gt_masked, mode='sum')
+            g_l2_loss_rel = l2_loss(pred_traj_fake_rel_masked, pred_traj_gt_rel_masked, mode='sum')
 
             ade = displacement_error(pred_traj_fake, pred_traj_gt, future_valid)
             ade_8 = displacement_error_by_time(pred_traj_fake, pred_traj_gt, future_valid, 8)

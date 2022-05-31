@@ -96,7 +96,7 @@ class PhysicalAttention(nn.Module):
     def __init__(self):
         super(PhysicalAttention, self).__init__()
 
-        self.L = 16
+        self.L = ATTN_L
         self.D = ATTN_D
         self.D_down = ATTN_D_DOWN
         self.bottleneck_dim = BOTTLENECK_DIM

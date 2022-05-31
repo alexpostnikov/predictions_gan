@@ -61,7 +61,7 @@ def displacement_error_by_time(pred_traj, pred_traj_gt, future_valid, time=8, mo
     seq_len, _, _ = pred_traj.size()
     loss = pred_traj_gt.permute(1, 0, 2) - pred_traj.permute(1, 0, 2)
     loss = (loss**2)
-    loss = torch.sqrt(loss[:, :int(n_steps)].sum(dim=2))[future_valid[:, int(n_steps)-1] > 0] #.sum(dim=1)
+    loss = torch.sqrt(loss[:, :int(n_steps)].sum(dim=2))[future_valid[:, :int(n_steps)] > 0] #.sum(dim=1)
     if mode == 'sum':
         return torch.sum(loss)
     if mode == 'mean':
