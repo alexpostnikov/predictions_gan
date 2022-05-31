@@ -298,6 +298,8 @@ def get_pose_from_batch_to_predict(data: dict):
         [data["state/future/x"].reshape(-1, 128, 80, 1), data["state/future/y"].reshape(-1, 128, 80, 1)], dim=3)
     # cat past and current
     past_current = torch.cat([past_pose, current_pose], dim=2)
+    past_valid = data["state/past/valid"].reshape(-1, 128, 10) > 0
+    past_current[:, :, :-1][past_valid == 0] = 0
     state_to_predict = past_current[masks.nonzero(as_tuple=True)]
 
     state_to_predict_with_neighbours = torch.zeros(state_to_predict.shape[0], 128, state_to_predict.shape[1], 2)
@@ -344,7 +346,6 @@ def create_rot_matrix(state: torch.Tensor, bbox_yaw: torch.Tensor, past_valid: t
     :return: torch.Tensor [bs, 2, 2] - transformation matrix, torch.Tensor [bs, 1, 2] - translation vector
     """
     last_step = (state[:, -1] - state[:, -2])
-
     bbox_yaw_my = torch.atan2(last_step[:, 1], last_step[:, 0])
     bbox_yaw[past_valid != 0] = bbox_yaw_my[past_valid != 0]
     rot_mat = torch.zeros([state.shape[0], 2, 2], device=state.device, dtype=torch.float64)
