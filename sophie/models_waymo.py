@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from constants import *
+import torchvision.models as models
 
 def make_mlp(dim_list):
     layers = []
@@ -88,33 +89,7 @@ class Decoder(nn.Module):
         return pred_traj_fake_rel
 
 
-class CnnEncoder(nn.Module):
-    def __init__(self):
-        super(CnnEncoder, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.BatchNorm2d(32),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.BatchNorm2d(64),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.BatchNorm2d(128),
-            nn.Conv2d(128, 512, kernel_size=3, stride=1, padding=1),
-            nn.Flatten(2),
-            nn.Linear(14**2, 1)
-            # nn.ReLU(),
-            # nn.MaxPool2d(kernel_size=8, stride=8),
-            )
 
-    def forward(self, x):
-        x = self.layers(x)
-        x = x.view(x.size(0), -1)
-        return x
 
 
 class PhysicalAttention(nn.Module):
@@ -214,7 +189,8 @@ class TrajectoryGenerator(nn.Module):
         self.sattn = SocialAttention()
         self.pattn = PhysicalAttention()
         self.decoder = Decoder()
-        self.cnn_encoder = CnnEncoder()
+        self.cnn_encoder = models.resnet18(pretrained=True).cuda()
+        self.cnn_encoder.fc = nn.Linear(512, ATTN_D)
         input_dim = self.h_dim + 2*self.bottleneck_dim
         mlp_decoder_context_dims = [input_dim, self.mlp_dim, self.h_dim - self.noise_dim]
         self.mlp_decoder_context = make_mlp(mlp_decoder_context_dims)
@@ -236,7 +212,6 @@ class TrajectoryGenerator(nn.Module):
         vgg_list = self.cnn_encoder(img)
         attn_p = self.pattn(vgg_list, end_pos)
         mlp_decoder_context_input = torch.cat([final_encoder_h[:, 0, :], attn_s, attn_p], dim=1)
-
         noise_input = self.mlp_decoder_context(mlp_decoder_context_input)
         decoder_h = self.add_noise(noise_input)
         decoder_h = torch.unsqueeze(decoder_h, 0)
@@ -260,9 +235,9 @@ class TrajectoryDiscriminator(nn.Module):
         self.encoder = Encoder()
         real_classifier_dims = [self.h_dim, self.mlp_dim, 1]
         self.real_classifier = make_mlp(real_classifier_dims)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, traj, traj_rel):
-
         final_h = self.encoder(traj_rel)
         scores = self.real_classifier(final_h)
-        return scores
+        return self.sigmoid(scores)
