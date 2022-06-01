@@ -115,9 +115,7 @@ def vis_cur_and_fut(decoded_example, predictions=None, size_pixels=1000, bn=0, c
     m = current_states_mask
     prediction = None
     if predictions is not None:
-        prediction = predictions.clone() #[(data["state/tracks_to_predict"]>0).nonzero()].detach().cpu().numpy()
-        # prediction = prediction[:,0] #+ current_states[:,np.newaxis][data["state/tracks_to_predict"]>0]
-        # # predictions = predictions.cumsum(1)
+        prediction = predictions.clone()
 
     future_states_mask *= np.repeat(data["state/tracks_to_predict"].reshape(128, 1), 80, axis=1)>0
     im = visualize_one_step_with_future(s[:, 0], m[:, 0], future_states, future_states_mask, roadgraph_xyz,

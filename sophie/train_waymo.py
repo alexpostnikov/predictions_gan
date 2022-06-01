@@ -109,6 +109,8 @@ def main():
     print(discriminator)
 
     optimizer_g = optim.Adam(generator.parameters(), lr=G_LR)
+    # scheduller for generator
+    scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=G_LR_DECAY_STEP, gamma=G_LR_DECAY_RATE)
     optimizer_d = optim.Adam(discriminator.parameters(), lr=D_LR)
 
     t, epoch = 0, 0
@@ -138,7 +140,7 @@ def main():
             if g_steps_left > 0:
                 losses_g, predictions = generator_step(batch, generator,
                                                        discriminator, gan_g_loss,
-                                                       optimizer_g)
+                                                       optimizer_g, scheduler_g)
                 g_steps_left -= 1
                 str_to_log += ' G_loss: {}'.format(losses_g)
                 pbar.set_description(str_to_log)
@@ -251,7 +253,7 @@ def rotate_predictions_to_abs_cs(generator_out, obs_traj, rot_mat_inv):
         return pred_traj_fake_abs, generator_out
 
 
-def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
+def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g, scheduler=None):
     batch = [tensor.cuda() for tensor in batch]
     (obs_traj_, pred_traj_gt_, obs_traj_rel_, pred_traj_gt_rel_, vgg_list, rot_mat_inv, future_valid) = batch
     obs_traj = obs_traj_.permute(2, 0, 1, 3)
@@ -308,6 +310,8 @@ def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
 
     optimizer_g.zero_grad()
     loss.backward()
+    if scheduler is not None:
+        scheduler.step()
     optimizer_g.step()
 
     return losses, predictions
