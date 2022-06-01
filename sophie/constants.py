@@ -19,10 +19,10 @@ G_STEPS = 1
 D_STEPS = 1
 
 MAX_PEDS = 128
-BEST_K = 20
-PRINT_EVERY = 3000  # batch
-NUM_SAMPLES = 20
-NUM_SAMPLES_CHECK = 10000  # samples
+BEST_K = 4
+PRINT_EVERY = 1000  # batch
+NUM_MODES = 5
+NUM_SAMPLES_CHECK = 2000  # samples
 
 ATTN_L = 90
 ATTN_D = 512  # cnn out shape

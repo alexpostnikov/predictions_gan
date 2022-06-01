@@ -56,7 +56,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, num_modes=5):
         super(Decoder, self).__init__()
 
         self.seq_len = PRED_LEN
@@ -64,25 +64,31 @@ class Decoder(nn.Module):
         self.embedding_dim = EMBEDDING_DIM
 
         self.decoder = nn.LSTM(self.embedding_dim, self.h_dim, 1)
-        self.spatial_embedding = nn.Sequential(nn.Linear(2, self.embedding_dim), nn.ReLU(),
+        self.num_modes = num_modes
+        if self.num_modes is None:
+            self.num_modes = 1
+        self.spatial_embedding = nn.Sequential(nn.Linear(2 * self.num_modes, self.embedding_dim), nn.ReLU(),
                                                nn.Linear(self.embedding_dim, self.embedding_dim))
-        self.hidden2pos = nn.Sequential(nn.Linear(self.h_dim, 128), nn.ReLU() ,nn.Linear(128, 2))
+        self.hidden2pos = nn.Sequential(nn.Linear(self.h_dim, 128), nn.ReLU(), nn.Linear(128, 2 * self.num_modes))
 
     def forward(self, last_pos, last_pos_rel, state_tuple):
         npeds = last_pos.size(0)
         pred_traj_fake_rel = []
+        # repeat last_pos_rel self.num_modes times
+        last_pos_rel = last_pos_rel.unsqueeze(1).repeat(1, self.num_modes, 1).reshape(npeds, 2 * self.num_modes)
         decoder_input = self.spatial_embedding(last_pos_rel)
         decoder_input = decoder_input.view(1, npeds, self.embedding_dim)
 
         for _ in range(self.seq_len):
             output, state_tuple = self.decoder(decoder_input, state_tuple)
             rel_pos = self.hidden2pos(output.view(-1, self.h_dim))
+            rel_pos = rel_pos.reshape(npeds, 2, self.num_modes)
             # curr_pos = rel_pos + last_pos
             embedding_input = rel_pos
 
-            decoder_input = self.spatial_embedding(embedding_input)
+            decoder_input = self.spatial_embedding(embedding_input.view(-1, 2 * self.num_modes))
             decoder_input = decoder_input.view(1, npeds, self.embedding_dim)
-            pred_traj_fake_rel.append(rel_pos.view(npeds, -1))
+            pred_traj_fake_rel.append(rel_pos.view(npeds, 2, -1))
             # last_pos = curr_pos
 
         pred_traj_fake_rel = torch.stack(pred_traj_fake_rel, dim=0)
@@ -174,7 +180,7 @@ class SocialAttention(nn.Module):
 
 
 class TrajectoryGenerator(nn.Module):
-    def __init__(self):
+    def __init__(self, num_modes=NUM_MODES):
         super(TrajectoryGenerator, self).__init__()
 
         self.obs_len = OBS_LEN
@@ -188,7 +194,7 @@ class TrajectoryGenerator(nn.Module):
         self.encoder = Encoder()
         self.sattn = SocialAttention()
         self.pattn = PhysicalAttention()
-        self.decoder = Decoder()
+        self.decoder = Decoder(num_modes)
         self.cnn_encoder = models.resnet18(pretrained=True).cuda()
         self.cnn_encoder.fc = nn.Linear(512, ATTN_D)
         input_dim = self.h_dim + 2*self.bottleneck_dim

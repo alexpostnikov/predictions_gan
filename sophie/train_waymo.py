@@ -197,7 +197,9 @@ def discriminator_step(batch, generator, discriminator, d_loss_fn, optimizer_d):
     loss = torch.zeros(1).to(pred_traj_gt)
 
     generator_out = generator(obs_traj, obs_traj_rel, vgg_list)
-
+    # chose random number from 0 to NUM_MODES
+    mode = np.random.randint(0, NUM_MODES)
+    generator_out = generator_out[:, :, :, mode]
     pred_traj_fake_abs, pred_traj_fake_rel = rotate_predictions_to_abs_cs(generator_out, obs_traj, rot_mat_inv)
 
     future_valid = future_valid.permute(1, 0)[[torch.arange(80)[4::5]]]
@@ -270,19 +272,20 @@ def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g, sche
     predictions = []
     for _ in range(BEST_K):
         generator_out = generator(obs_traj, obs_traj_rel, vgg_list)
-        predictions.append(generator_out.clone())
-        pred_traj_fake_abs, pred_traj_fake_rel = rotate_predictions_to_abs_cs(generator_out, obs_traj, rot_mat_inv)
-        pred_traj_fake_abs[future_valid.permute(1, 0)[torch.arange(80)[4::5]] == 0] *= 0
-        pred_traj_fake_rel[future_valid.permute(1, 0)[torch.arange(80)[4::5]] == 0] *= 0
-
-        dist = torch.norm(pred_traj_fake_rel - pred_traj_gt_rel[torch.arange(80)[4::5]], dim=2)
-        g_l2_loss_rel.append(dist)
+        for i in range(generator_out.shape[3]):
+            predictions.append(generator_out[:, :, :, i].clone())
+            pred_traj_fake_abs, pred_traj_fake_rel = rotate_predictions_to_abs_cs(generator_out[:, :, :, i], obs_traj,
+                                                                                  rot_mat_inv)
+            pred_traj_fake_abs[future_valid.permute(1, 0)[torch.arange(80)[4::5]] == 0] *= 0
+            pred_traj_fake_rel[future_valid.permute(1, 0)[torch.arange(80)[4::5]] == 0] *= 0
+            dist = torch.norm(pred_traj_fake_rel - pred_traj_gt_rel[torch.arange(80)[4::5]], dim=2)
+            g_l2_loss_rel.append(dist)
 
     npeds = obs_traj.size(1)  # bs
     pr = torch.stack(predictions, dim=0)
     ll = 0.1 * -log_likelihood(pred_traj_gt_rel[torch.arange(80)[4::5]].permute(1, 0, 2).unsqueeze(2),
                                pr.permute(2, 1, 0, 3),
-                               weights=torch.ones(npeds, BEST_K).cuda() / BEST_K)
+                               weights=torch.ones(npeds, BEST_K * NUM_MODES).cuda() / (BEST_K * NUM_MODES))
     losses['G_diversity_loss'] = ll.mean()
     loss += NLL_LOSS_COEF * ll.mean()
 
@@ -347,7 +350,27 @@ def check_accuracy(loader, generator, discriminator, d_loss_fn, limit=False):
             pred_traj_gt_rel = pred_traj_gt_rel_.permute(1, 0, 2)[[torch.arange(80)[4::5]]]
             pred_traj_gt = pred_traj_gt_.permute(1, 0, 2)[[torch.arange(80)[4::5]]]
             future_valid = future_valid[:, torch.arange(80)[4::5]]
-            pred_traj_fake_rel = generator(obs_traj, obs_traj_rel, vgg_list)
+
+            g_l2_loss_rel = []
+            predictions = []
+            for _ in range(BEST_K):
+                generator_out = generator(obs_traj, obs_traj_rel, vgg_list)
+                for i in range(generator_out.shape[3]):
+                    predictions.append(generator_out[:, :, :, i].clone())
+                    pred_traj_fake_abs, pred_traj_fake_rel = rotate_predictions_to_abs_cs(generator_out[:, :, :, i],
+                                                                                          obs_traj,
+                                                                                          rot_mat_inv)
+                    pred_traj_fake_abs[future_valid.permute(1, 0) == 0] *= 0
+                    pred_traj_fake_rel[future_valid.permute(1, 0) == 0] *= 0
+                    dist = torch.norm(pred_traj_fake_rel - pred_traj_gt_rel, dim=2).mean(0)
+                    g_l2_loss_rel.append(dist)
+
+            # choose random number from 0 to NUM_MODES
+            pr = torch.stack(predictions, dim=0)
+            ind = torch.stack(g_l2_loss_rel,0).min(0).indices
+            pred_traj_fake_rel = pr.index_select(0, ind).diagonal(dim1=0, dim2=2).permute(0,2,1)
+            # torch.stack(g_l2_loss_rel, 0).index_select(0, ind).diag()
+
             state_to_predict_p = state_to_predict_with_neighbours.to(pred_traj_fake_rel.device).permute(2, 0, 1, 3)
             pred_traj_fake, _ = rotate_predictions_to_abs_cs(pred_traj_fake_rel, state_to_predict_p,
                                                              inv_rot.cuda())
