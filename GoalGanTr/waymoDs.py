@@ -1,3 +1,5 @@
+import math
+
 from torch.utils.data import Dataset, DataLoader
 import pathlib
 import numpy as np
@@ -5,7 +7,7 @@ from six.moves import cPickle as pickle
 import torch
 from typing import Tuple, Optional
 import collections
-
+import wandb
 
 class RoadGraph:
     def __init__(self, rg: torch.Tensor, types: torch.Tensor, ids: torch.Tensor, valid: torch.Tensor):
@@ -18,28 +20,30 @@ class RoadGraph:
         self.valid_ind = 5
         pass
 
-    def grouped_by_object(self, object_id: int) -> torch.Tensor:
+    def grouped_by_object(self, object_id: int, num_points_max: int = 64) -> torch.Tensor:
         out = []
         max_seq_len = 0
         for i in range(self.rg.shape[0]):
             object = self.rg[i][(self.rg[i, :, 4] == object_id)]
             object = object[object[:, self.valid_ind] > 0]
-            if object.shape[0] > 256:
-                pick_every = object.shape[0] // 256 +1
+            if object.shape[0] > num_points_max:
+                pick_every = object.shape[0] // num_points_max +1
                 object = object[::pick_every]
             seq_len = object.shape[0]
             if seq_len > max_seq_len:
                 max_seq_len = seq_len
 
             out.append(object)
-        out_tensor = torch.zeros((self.rg.shape[0], max_seq_len, self.rg.shape[2]))
+        out_tensor = torch.zeros((self.rg.shape[0], num_points_max, self.rg.shape[2]), device=self.rg.device)
         for i in range(self.rg.shape[0]):
-            out_tensor[i, :, :] = torch.cat([out[i], torch.zeros((max_seq_len - out[i].shape[0], self.rg.shape[2]))], dim=0)
+            out_tensor[i, :, :] = torch.cat([out[i], torch.zeros((num_points_max - out[i].shape[0], self.rg.shape[2]),
+                                                                 device = out[i].device)], dim=0)
         return out_tensor
 
 
     def all_objects(self, by_type=0, by_id=0) -> torch.Tensor:
         out = []
+        extra = []
         max_seq_len = 0
         assert by_type == 0 or by_id == 0
         assert by_type + by_id == 1
@@ -54,39 +58,64 @@ class RoadGraph:
 
         unique_objects = torch.unique(self.rg[:, :, selector])
         for obj_id in unique_objects:
+            if obj_id == -1:
+                continue
             object = searcher(obj_id)
             seq_len = object.shape[1]
             if seq_len > max_seq_len:
                 max_seq_len = seq_len
-            out.append(object)
-        out_tensor = torch.zeros((self.rg.shape[0], len(unique_objects), max_seq_len, self.rg.shape[2]))
-        for j in range(len(unique_objects)):
-            out_tensor[:, j, :, :] = torch.cat([out[j], torch.zeros((self.rg.shape[0], max_seq_len - out[j].shape[1], self.rg.shape[2]))], dim=1)
+            if object.ndim == 3:
+                out.append(object)
+            if object.ndim == 4:
+                out.append(object[:, 0])
+                extra.append(object[:, 1:])
+        out_tensor = torch.zeros((self.rg.shape[0], len(out), max_seq_len, self.rg.shape[2]), device=self.rg.device)
+        for j in range(len(out)):
+            out_tensor[:, j, :, :] = torch.cat([out[j],
+                                                torch.zeros((self.rg.shape[0], max_seq_len - out[j].shape[1], self.rg.shape[2]),device=self.rg.device)
+                                                ], dim=1)
         return out_tensor
 
+    def split_big_line_to_smaller(self, line, n_splits, max_points_per_split=256):
+        nump_points, data_shape = line.shape
 
-    def grouped_by_type(self, type_id: int) -> torch.Tensor:
+        np_per_new_line = math.ceil(nump_points / n_splits)
+        div_coef = 1
+        if np_per_new_line > max_points_per_split:
+            div_coef = max(1, np_per_new_line//max_points_per_split+1)
+            # np_per_new_line = max_points_per_split
+
+        out = torch.zeros(n_splits, max_points_per_split, data_shape).to(line.device)
+
+        for i in range(n_splits):
+            points = line[i * np_per_new_line: (i + 1) * np_per_new_line][::div_coef]
+            out[i, :len(points)] = points
+        return out
+
+    def grouped_by_type(self, type_id: int, num_points_max: int = 256) -> torch.Tensor:
         out = []
         max_seq_len = 0
         for i in range(self.rg.shape[0]):
             object = self.rg[i][(self.rg[i, :, 3] == type_id)]
             object = object[object[:, self.valid_ind] > 0]
-            if object.shape[0] > 256:
-                pick_every = object.shape[0] // 256 + 1
+            if object.shape[0] > num_points_max:
+                pick_every = object.shape[0] // num_points_max + 1
+                # if pick_every > 5:
+                #     num_splits = pick_every // 5 + 1
+                #     object = self.split_big_line_to_smaller(object, num_splits, num_points_max)
+                #     [out.append(object[i]) for i in range(object.shape[0])]
+                #     continue
                 object = object[::pick_every]
-            seq_len = object.shape[0]
-            if seq_len > max_seq_len:
-                max_seq_len = seq_len
-
             out.append(object)
-        out_tensor = torch.zeros((self.rg.shape[0], max_seq_len, self.rg.shape[2]))
+        out_tensor = torch.zeros((self.rg.shape[0], num_points_max, self.rg.shape[2]), device=self.rg.device)
         for i in range(self.rg.shape[0]):
-            out_tensor[i, :, :] = torch.cat([out[i], torch.zeros((max_seq_len - out[i].shape[0], self.rg.shape[2]))], dim=0)
+            out_tensor[i, :, :] = torch.cat([out[i], torch.zeros((num_points_max - out[i].shape[0], self.rg.shape[2]),
+                                                                 device=self.rg.device)], dim=0)
         return out_tensor
 
 
 
-class WaymoSophieDS(Dataset):
+class WaymoDS(Dataset):
     """
     Loads the Waymo dataset (preprocessed, saved in torch map style).
     """
@@ -382,7 +411,7 @@ def get_pose_from_batch_to_predict(data: dict):
     past_current[:, :, :-1][past_valid == 0] = 0
     state_to_predict = past_current[masks.nonzero(as_tuple=True)]
 
-    state_to_predict_with_neighbours = torch.zeros(state_to_predict.shape[0], 128, state_to_predict.shape[1], 2)
+    state_to_predict_with_neighbours = torch.zeros(state_to_predict.shape[0], 128, state_to_predict.shape[1], 2, device=state_to_predict.device)
     real_bn = 0
     for original_bn, index in masks.nonzero():
         state_to_predict_with_neighbours[real_bn] = past_current[original_bn]
@@ -442,6 +471,23 @@ import re
 np_str_obj_array_pattern = re.compile(r'[SaUO]')
 string_classes = (str, bytes)
 
+
+def simpl_collate_fn(batch):
+    r"""Puts each data field into a tensor with outer dimension batch size"""
+    out_batch = []
+    if isinstance(batch[0], dict) and "state/current/x" in batch[0]:
+        out_batch = {}
+        for key in batch[0]:
+            if key == "scenario/id":
+                continue
+            k = [batch[i][key] for i in range(len(batch))]
+            if isinstance(k[0], np.ndarray):
+                k = torch.from_numpy(np.stack(k, axis=0))
+            else:
+                raise
+            out_batch[key] = k
+        return out_batch
+    raise  # TypeError(default_collate_err_msg_format.format(elem_type))
 
 def d_collate_fn(batch):
     r"""Puts each data field into a tensor with outer dimension batch size"""
@@ -503,15 +549,17 @@ if __name__ == "__main__":
     import tqdm
     import matplotlib.pyplot as plt
     import matplotlib
+
+
     # test waymo dataset
     ds_path = "/media/robot/hdd1/waymo_ds/"
     in_path = "/media/robot/hdd1/waymo_ds/training_mapstyle/index_file.txt"
-    waymo_dataset = WaymoSophieDS(data_path=ds_path, index_file=in_path)
+    waymo_dataset = WaymoDS(data_path=ds_path, index_file=in_path)
     for num, waymo_data in enumerate(tqdm.tqdm(waymo_dataset)):
         if num>2:
             break
 
-    waymo_dataset = WaymoSophieDS(data_path=ds_path, index_file=in_path,
+    waymo_dataset = WaymoDS(data_path=ds_path, index_file=in_path,
                                   rgb_index_path="/media/robot/hdd1/waymo_ds/rendered/train/index.pkl",
                                   rgb_prefix="/media/robot/hdd1/waymo_ds/")
     loader = DataLoader(waymo_dataset, batch_size=2, shuffle=False, num_workers=0, collate_fn=d_collate_fn)
@@ -547,8 +595,10 @@ if __name__ == "__main__":
             pc_t = pc[0][(types == rs_type)[0, :, 0]]
             ax[1, 1].scatter(pc_t[:, 0], pc_t[:, 1], s=0.02)
         # add poses with red stars
-        ax[1, 1].scatter(state_to_predict[0, :, 0], state_to_predict[0, :, 1], s=4.2, c="r", marker="*")
-        ax[1, 1].set_aspect('equal')
+        num_preds_in_batch = (waymo_data["state/tracks_to_predict"][0] > 0).sum()
+        for i in range(num_preds_in_batch):
+            ax[1, 1].scatter(state_to_predict[i, :, 0], state_to_predict[i, :, 1], s=4.2, c="r", marker="*")
+            ax[1, 1].set_aspect('equal')
         center = (state_to_predict[0, -1, 0], state_to_predict[0, -1, 1])
         # generate a circle with radius 100:
         circle = plt.Circle(center, 100, color='r', fill=False)
@@ -584,7 +634,6 @@ if __name__ == "__main__":
         ax[2, 0].set_aspect('equal')
         ax[2, 0].set_title("Roadgraph in 50m")
 
-
         roadGraph = RoadGraph(waymo_data["roadgraph_samples/xyz"], ids=waymo_data["roadgraph_samples/id"],
                               types=waymo_data["roadgraph_samples/type"],
                               valid=waymo_data["roadgraph_samples/valid"])
@@ -595,7 +644,7 @@ if __name__ == "__main__":
         print("time for grouped_by_object: ", end - start)
         # measure time of operation below:
         start = time.time()
-        objects_grouped = roadGraph.all_objects(by_type=1)
+        objects_grouped = roadGraph.all_objects(by_id=1)
         end = time.time()
         print("time for all_objects: ", end - start)
         print("shape of objects_grouped: ", objects_grouped.shape)
